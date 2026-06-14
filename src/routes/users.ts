@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
+import { AppDataSource } from '../data-source';
+import { User } from '../entities/User';
 import { requireAuth, AuthRequest } from '../middleware/auth';
 
 const router = Router();
@@ -13,11 +14,7 @@ const reminderSchema = z.object({
   reminder_time: z.string().regex(/^\d{2}:\d{2}$/, 'Must be HH:MM format'),
 });
 
-// ─── PATCH /api/users/push-token ──────────────────────────────────────────────
-//
-// Saves the Expo push token for the authenticated user.
-// Called by the mobile app after the user grants notification permission.
-
+// PATCH /api/users/push-token
 router.patch('/push-token', requireAuth, async (req: AuthRequest, res) => {
   const parsed = pushTokenSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -25,18 +22,14 @@ router.patch('/push-token', requireAuth, async (req: AuthRequest, res) => {
     return;
   }
 
-  await pool.query(
-    'UPDATE users SET expo_push_token = $1 WHERE id = $2',
-    [parsed.data.expo_push_token, req.userId],
-  );
+  await AppDataSource.getRepository(User).update(req.userId!, {
+    expoPushToken: parsed.data.expo_push_token,
+  });
 
   res.json({ data: { message: 'Push token saved' } });
 });
 
-// ─── PATCH /api/users/reminder-time ──────────────────────────────────────────
-//
-// Updates the user's preferred daily reminder time (HH:MM, 24-hour format).
-
+// PATCH /api/users/reminder-time
 router.patch('/reminder-time', requireAuth, async (req: AuthRequest, res) => {
   const parsed = reminderSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -44,10 +37,9 @@ router.patch('/reminder-time', requireAuth, async (req: AuthRequest, res) => {
     return;
   }
 
-  await pool.query(
-    'UPDATE users SET reminder_time = $1 WHERE id = $2',
-    [parsed.data.reminder_time, req.userId],
-  );
+  await AppDataSource.getRepository(User).update(req.userId!, {
+    reminderTime: parsed.data.reminder_time,
+  });
 
   res.json({ data: { message: 'Reminder time updated' } });
 });

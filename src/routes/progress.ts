@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
-import { requireAuth, AuthRequest } from '../middleware/auth';
+import { AppDataSource } from '../data-source';
+import { UserProgress } from '../entities/UserProgress';
 import { updateStreak } from '../services/streak';
+import { requireAuth, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
@@ -12,14 +13,8 @@ const progressSchema = z.object({
   time_taken_seconds: z.number().int().positive().optional(),
 });
 
-// ─── POST /api/progress ───────────────────────────────────────────────────────
-//
-// Logs a problem attempt (solve / fail / skip).
-// If the user has already attempted this problem, the record is updated (upsert).
-// Solving a problem also triggers the streak update logic.
-
+// POST /api/progress — log a problem attempt (upsert: re-attempting updates the existing record)
 router.post('/', requireAuth, async (req: AuthRequest, res) => {
-  // Step 1: validate request body
   const parsed = progressSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.flatten() });
@@ -27,41 +22,41 @@ router.post('/', requireAuth, async (req: AuthRequest, res) => {
   }
 
   const { problem_id, status, time_taken_seconds } = parsed.data;
+  const repo = AppDataSource.getRepository(UserProgress);
 
-  // Step 2: upsert the progress record
-  // ON CONFLICT updates if the user re-attempts the same problem
-  const { rows } = await pool.query(
-    `INSERT INTO user_progress (user_id, problem_id, status, time_taken_seconds)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (user_id, problem_id)
-     DO UPDATE SET status = $3, time_taken_seconds = $4, solved_at = NOW()
-     RETURNING *`,
-    [req.userId, problem_id, status, time_taken_seconds ?? null],
-  );
+  let record = await repo.findOne({ where: { userId: req.userId!, problemId: problem_id } });
 
-  // Step 3: if they solved it, update their daily streak
+  if (record) {
+    record.status = status;
+    record.timeTakenSeconds = time_taken_seconds ?? null;
+    record.solvedAt = new Date();
+  } else {
+    record = repo.create({
+      userId: req.userId!,
+      problemId: problem_id,
+      status,
+      timeTakenSeconds: time_taken_seconds ?? null,
+    });
+  }
+
+  await repo.save(record);
+
   if (status === 'solved') {
     await updateStreak(req.userId!);
   }
 
-  res.status(201).json({ data: rows[0] });
+  res.status(201).json({ data: record });
 });
 
-// ─── GET /api/progress ────────────────────────────────────────────────────────
-//
-// Returns all progress records for the authenticated user.
-
+// GET /api/progress — all attempts for the authenticated user
 router.get('/', requireAuth, async (req: AuthRequest, res) => {
-  const { rows } = await pool.query(
-    `SELECT up.*, p.title, p.difficulty, p.pattern
-     FROM user_progress up
-     JOIN problems p ON p.id = up.problem_id
-     WHERE up.user_id = $1
-     ORDER BY up.solved_at DESC`,
-    [req.userId],
-  );
+  const records = await AppDataSource.getRepository(UserProgress).find({
+    where: { userId: req.userId },
+    relations: { problem: true },
+    order: { solvedAt: 'DESC' },
+  });
 
-  res.json({ data: rows });
+  res.json({ data: records });
 });
 
 export default router;

@@ -1,92 +1,82 @@
 import { Router } from 'express';
-import { pool } from '../db/pool';
+import { AppDataSource } from '../data-source';
+import { Stage } from '../entities/Stage';
+import { UserProgress } from '../entities/UserProgress';
 import { requireAuth, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
-// ─── GET /api/roadmap ─────────────────────────────────────────────────────────
-//
-// Returns all 7 stages with their topics and problems nested inside.
-// Also includes the user's progress status on each problem.
-//
-// Response shape:
-// [{ id, number, title, topics: [{ id, name, problems: [{ id, title, difficulty, pattern, status }] }] }]
-
+// GET /api/roadmap
+// Returns all stages → topics → problems, with the user's progress status on each problem.
 router.get('/', requireAuth, async (req: AuthRequest, res) => {
-  // Step 1: fetch all stages ordered by their number
-  const { rows: stages } = await pool.query(
-    'SELECT id, number, title FROM stages ORDER BY number',
-  );
+  const stages = await AppDataSource.getRepository(Stage).find({
+    order: { number: 'ASC' },
+    relations: { topics: { problems: true } },
+  });
 
-  // Step 2: fetch all topics grouped by stage
-  const { rows: topics } = await pool.query(
-    'SELECT id, stage_id, name FROM topics ORDER BY name',
-  );
+  const progress = await AppDataSource.getRepository(UserProgress).find({
+    where: { userId: req.userId },
+  });
 
-  // Step 3: fetch all problems
-  const { rows: problems } = await pool.query(
-    'SELECT id, topic_id, title, difficulty, pattern FROM problems ORDER BY title',
-  );
-
-  // Step 4: fetch this user's progress to mark solved/failed/skipped
-  const { rows: progress } = await pool.query(
-    'SELECT problem_id, status FROM user_progress WHERE user_id = $1',
-    [req.userId],
-  );
-
-  // Build a quick lookup map: problemId → status
-  const progressMap = new Map(progress.map((p) => [p.problem_id, p.status]));
-
-  // Step 5: assemble the nested structure in memory (faster than a recursive SQL query)
-  const topicMap = new Map(topics.map((t) => ({ ...t, problems: [] as typeof problems }))
-    .map((t) => [t.id, t]));
-
-  for (const problem of problems) {
-    const topic = topicMap.get(problem.topic_id);
-    if (topic) {
-      topic.problems.push({ ...problem, status: progressMap.get(problem.id) ?? null });
-    }
-  }
+  const progressMap = new Map(progress.map((p) => [p.problemId, p.status]));
 
   const result = stages.map((stage) => ({
-    ...stage,
-    topics: topics
-      .filter((t) => t.stage_id === stage.id)
-      .map((t) => topicMap.get(t.id)),
+    id: stage.id,
+    number: stage.number,
+    title: stage.title,
+    topics: stage.topics.map((topic) => ({
+      id: topic.id,
+      name: topic.name,
+      problems: topic.problems.map((problem) => ({
+        id: problem.id,
+        title: problem.title,
+        difficulty: problem.difficulty,
+        pattern: problem.pattern,
+        status: progressMap.get(problem.id) ?? null,
+      })),
+    })),
   }));
 
   res.json({ data: result });
 });
 
-// ─── GET /api/roadmap/next ────────────────────────────────────────────────────
-//
-// Returns the next unsolved problem for the authenticated user,
-// following the stage → topic → problem order.
-
+// GET /api/roadmap/next
+// Returns the first unsolved problem in stage order.
 router.get('/next', requireAuth, async (req: AuthRequest, res) => {
-  // Find the first problem (by stage number, then problem title) that the user
-  // hasn't solved yet
-  const { rows } = await pool.query(
-    `SELECT p.id, p.title, p.difficulty, p.pattern, t.name AS topic, s.number AS stage_number, s.title AS stage_title
-     FROM problems p
-     JOIN topics t ON t.id = p.topic_id
-     JOIN stages s ON s.id = t.stage_id
-     WHERE p.id NOT IN (
-       SELECT problem_id FROM user_progress
-       WHERE user_id = $1 AND status = 'solved'
-     )
-     ORDER BY s.number, p.title
-     LIMIT 1`,
-    [req.userId],
+  const stages = await AppDataSource.getRepository(Stage).find({
+    order: { number: 'ASC' },
+    relations: { topics: { problems: true } },
+  });
+
+  const progress = await AppDataSource.getRepository(UserProgress).find({
+    where: { userId: req.userId },
+  });
+
+  const solvedIds = new Set(
+    progress.filter((p) => p.status === 'solved').map((p) => p.problemId),
   );
 
-  if (rows.length === 0) {
-    // User has solved everything — congratulate them
-    res.json({ data: null, message: 'All problems solved!' });
-    return;
+  for (const stage of stages) {
+    for (const topic of stage.topics) {
+      for (const problem of topic.problems) {
+        if (!solvedIds.has(problem.id)) {
+          return res.json({
+            data: {
+              id: problem.id,
+              title: problem.title,
+              difficulty: problem.difficulty,
+              pattern: problem.pattern,
+              topicName: topic.name,
+              stageTitle: stage.title,
+              stageNumber: stage.number,
+            },
+          });
+        }
+      }
+    }
   }
 
-  res.json({ data: rows[0] });
+  res.json({ data: null, message: 'All problems solved!' });
 });
 
 export default router;
